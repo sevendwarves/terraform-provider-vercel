@@ -3,15 +3,19 @@ package vercel
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/float64validator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/mapvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/float64planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/mapplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setplanmodifier"
@@ -19,6 +23,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
+
 	"github.com/vercel/terraform-provider-vercel/v5/client"
 )
 
@@ -69,6 +74,8 @@ Provides a Configurable Log Drain resource.
 Log Drains collect all of your logs using a service specializing in storing app logs.
 
 Teams on Pro and Enterprise plans can subscribe to log drains that are generic and configurable from the Vercel dashboard without creating an integration. This allows you to use a HTTP service to receive logs through Vercel's log drains.
+
+-> **Note:** Write-Only argument ` + "`secret_wo`" + ` is available in place of ` + "`secret`" + ` to keep the signing secret out of Terraform plan and state artifacts. Write-Only arguments require HashiCorp Terraform 1.11.0 or later.
 
 ~> Only Pro and Enterprise teams can create Configurable Log Drains.`,
 		Attributes: map[string]schema.Attribute{
@@ -132,13 +139,34 @@ Teams on Pro and Enterprise plans can subscribe to log drains that are generic a
 				},
 			},
 			"secret": schema.StringAttribute{
-				Description:   "A custom secret to be used for signing log events. You can use this secret to verify that log events are coming from Vercel and are not tampered with. See https://vercel.com/docs/observability/log-drains/log-drains-reference#secure-log-drains for full info.",
+				Description:   "A custom secret to be used for signing log events. This value is persisted in Terraform state. Use `secret_wo` to omit the signing secret from plan and state artifacts. See https://vercel.com/docs/observability/log-drains/log-drains-reference#secure-log-drains for full info.",
 				Optional:      true,
 				Computed:      true,
 				Sensitive:     true,
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplaceIfConfigured(), stringplanmodifier.UseNonNullStateForUnknown()},
 				Validators: []validator.String{
 					stringvalidator.LengthAtLeast(32),
+					stringvalidator.ConflictsWith(path.MatchRoot("secret_wo")),
+				},
+			},
+			"secret_wo": schema.StringAttribute{
+				Description: "A write-only custom secret used to sign log events. The value is sent to Vercel during creation and is not persisted in Terraform plan or state artifacts. Requires `secret_wo_version`.",
+				Optional:    true,
+				Sensitive:   true,
+				WriteOnly:   true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(32),
+					stringvalidator.ConflictsWith(path.MatchRoot("secret")),
+					stringvalidator.AlsoRequires(path.MatchRoot("secret_wo_version")),
+				},
+			},
+			"secret_wo_version": schema.Int64Attribute{
+				Description:   "A persisted, non-secret version used to rotate `secret_wo`. Incrementing this value replaces the Log Drain.",
+				Optional:      true,
+				PlanModifiers: []planmodifier.Int64{int64planmodifier.RequiresReplace()},
+				Validators: []validator.Int64{
+					int64validator.AtLeast(1),
+					int64validator.AlsoRequires(path.MatchRoot("secret_wo")),
 				},
 			},
 			"sources": schema.SetAttribute{
@@ -161,20 +189,22 @@ Teams on Pro and Enterprise plans can subscribe to log drains that are generic a
 }
 
 type LogDrain struct {
-	ID             types.String  `tfsdk:"id"`
-	TeamID         types.String  `tfsdk:"team_id"`
-	Name           types.String  `tfsdk:"name"`
-	DeliveryFormat types.String  `tfsdk:"delivery_format"`
-	Environments   types.Set     `tfsdk:"environments"`
-	Headers        types.Map     `tfsdk:"headers"`
-	ProjectIDs     types.Set     `tfsdk:"project_ids"`
-	SamplingRate   types.Float64 `tfsdk:"sampling_rate"`
-	Secret         types.String  `tfsdk:"secret"`
-	Sources        types.Set     `tfsdk:"sources"`
-	Endpoint       types.String  `tfsdk:"endpoint"`
+	ID              types.String  `tfsdk:"id"`
+	TeamID          types.String  `tfsdk:"team_id"`
+	Name            types.String  `tfsdk:"name"`
+	DeliveryFormat  types.String  `tfsdk:"delivery_format"`
+	Environments    types.Set     `tfsdk:"environments"`
+	Headers         types.Map     `tfsdk:"headers"`
+	ProjectIDs      types.Set     `tfsdk:"project_ids"`
+	SamplingRate    types.Float64 `tfsdk:"sampling_rate"`
+	Secret          types.String  `tfsdk:"secret"`
+	SecretWO        types.String  `tfsdk:"secret_wo"`
+	SecretWOVersion types.Int64   `tfsdk:"secret_wo_version"`
+	Sources         types.Set     `tfsdk:"sources"`
+	Endpoint        types.String  `tfsdk:"endpoint"`
 }
 
-func responseToLogDrain(ctx context.Context, out client.LogDrain, secret types.String) (LogDrain, diag.Diagnostics) {
+func responseToLogDrain(ctx context.Context, out client.LogDrain, secret types.String, secretWOVersion types.Int64) (LogDrain, diag.Diagnostics) {
 	projectIDs, diags := types.SetValueFrom(ctx, types.StringType, out.ProjectIDs)
 	if diags.HasError() {
 		return LogDrain{}, diags
@@ -195,28 +225,39 @@ func responseToLogDrain(ctx context.Context, out client.LogDrain, secret types.S
 		return LogDrain{}, diags
 	}
 
-	if secret.IsNull() || secret.IsUnknown() {
+	if !secretWOVersion.IsNull() {
+		secret = types.StringNull()
+	} else if secret.IsNull() || secret.IsUnknown() {
 		secret = types.StringValue(out.Secret)
 	}
 
 	return LogDrain{
-		ID:             types.StringValue(out.ID),
-		TeamID:         toTeamID(out.TeamID),
-		Name:           types.StringValue(out.Name),
-		DeliveryFormat: types.StringValue(out.DeliveryFormat),
-		SamplingRate:   types.Float64PointerValue(out.SamplingRate),
-		Secret:         secret,
-		Endpoint:       types.StringValue(out.Endpoint),
-		Environments:   environments,
-		Headers:        headers,
-		Sources:        sources,
-		ProjectIDs:     projectIDs,
+		ID:              types.StringValue(out.ID),
+		TeamID:          toTeamID(out.TeamID),
+		Name:            types.StringValue(out.Name),
+		DeliveryFormat:  types.StringValue(out.DeliveryFormat),
+		SamplingRate:    types.Float64PointerValue(out.SamplingRate),
+		Secret:          secret,
+		SecretWO:        types.StringNull(),
+		SecretWOVersion: secretWOVersion,
+		Endpoint:        types.StringValue(out.Endpoint),
+		Environments:    environments,
+		Headers:         headers,
+		Sources:         sources,
+		ProjectIDs:      projectIDs,
 	}, nil
 }
 
 func (r *logDrainResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan LogDrain
 	diags := req.Plan.Get(ctx, &plan)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	var config LogDrain
+	diags = req.Config.Get(ctx, &config)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -250,6 +291,11 @@ func (r *logDrainResource) Create(ctx context.Context, req resource.CreateReques
 		return
 	}
 
+	secret := plan.Secret
+	if !config.SecretWO.IsNull() {
+		secret = config.SecretWO
+	}
+
 	out, err := r.client.CreateLogDrain(ctx, client.CreateLogDrainRequest{
 		TeamID:         plan.TeamID.ValueString(),
 		Name:           plan.Name.ValueString(),
@@ -258,7 +304,7 @@ func (r *logDrainResource) Create(ctx context.Context, req resource.CreateReques
 		Headers:        headers,
 		ProjectIDs:     projectIDs,
 		SamplingRate:   plan.SamplingRate.ValueFloat64(),
-		Secret:         plan.Secret.ValueString(),
+		Secret:         secret.ValueString(),
 		Sources:        sources,
 		Endpoint:       plan.Endpoint.ValueString(),
 	})
@@ -270,7 +316,7 @@ func (r *logDrainResource) Create(ctx context.Context, req resource.CreateReques
 		return
 	}
 
-	result, diags := responseToLogDrain(ctx, out, plan.Secret)
+	result, diags := responseToLogDrain(ctx, out, plan.Secret, plan.SecretWOVersion)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -317,7 +363,7 @@ func (r *logDrainResource) Read(ctx context.Context, req resource.ReadRequest, r
 		return
 	}
 
-	result, diags := responseToLogDrain(ctx, out, state.Secret)
+	result, diags := responseToLogDrain(ctx, out, state.Secret, state.SecretWOVersion)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -378,11 +424,12 @@ func (r *logDrainResource) Delete(ctx context.Context, req resource.DeleteReques
 }
 
 func (r *logDrainResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	teamID, id, ok := splitInto1Or2(req.ID)
+	importID, writeOnly := strings.CutPrefix(req.ID, "write-only:")
+	teamID, id, ok := splitInto1Or2(importID)
 	if !ok {
 		resp.Diagnostics.AddError(
 			"Error importing Log Drain",
-			fmt.Sprintf("Invalid id '%s' specified. should be in format \"team_id/log_drain_id\" or \"log_drain_id\"", req.ID),
+			fmt.Sprintf("Invalid id '%s' specified. should be in format \"team_id/log_drain_id\", \"log_drain_id\", or either format prefixed with \"write-only:\"", req.ID),
 		)
 		return
 	}
@@ -404,7 +451,13 @@ func (r *logDrainResource) ImportState(ctx context.Context, req resource.ImportS
 		return
 	}
 
-	result, diags := responseToLogDrain(ctx, out, types.StringNull())
+	secretWOVersion := types.Int64Null()
+	if writeOnly {
+		// Version zero marks imported state as write-only while ensuring every
+		// valid configured version forces replacement with a known secret.
+		secretWOVersion = types.Int64Value(0)
+	}
+	result, diags := responseToLogDrain(ctx, out, types.StringNull(), secretWOVersion)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
