@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -197,8 +196,6 @@ func (c *Client) _doRequest(req *http.Request, v any, errorOnNoContent bool) err
 	return nil
 }
 
-var sensitiveResponseTokenPattern = regexp.MustCompile(`[A-Za-z0-9_+/=-]{20,}`)
-
 // Sensitive endpoints can return bearer secrets in error messages or malformed bodies.
 func sanitizeSensitiveResponseError(err error, sensitiveValues []string) error {
 	if err == nil {
@@ -206,12 +203,15 @@ func sanitizeSensitiveResponseError(err error, sensitiveValues []string) error {
 	}
 	var apiErr APIError
 	if errors.As(err, &apiErr) {
-		for _, value := range sensitiveValues {
-			if value != "" {
-				apiErr.Message = strings.ReplaceAll(apiErr.Message, value, "[REDACTED]")
+		if len(sensitiveValues) == 0 {
+			apiErr.Message = "API request failed; response details omitted to protect secrets"
+		} else {
+			for _, value := range sensitiveValues {
+				if value != "" {
+					apiErr.Message = strings.ReplaceAll(apiErr.Message, value, "[REDACTED]")
+				}
 			}
 		}
-		apiErr.Message = sensitiveResponseTokenPattern.ReplaceAllString(apiErr.Message, "[REDACTED]")
 		apiErr.RawMessage = nil
 		switch apiErr.Code {
 		case "not_found", "forbidden", "bad_request", "invalid_input", "project_not_found", "protection_bypass_conflict", "rate_limited":
