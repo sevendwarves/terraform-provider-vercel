@@ -75,6 +75,43 @@ func TestLogDrainResponseErrorsDoNotExposeSigningSecret(t *testing.T) {
 	}
 }
 
+func TestCreateLogDrainPreservesSafeAPIErrorContext(t *testing.T) {
+	t.Parallel()
+
+	const signingSecret = "configured-secret-that-must-not-reach-diagnostics"
+	const headerSecret = "short-header-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(
+			w,
+			`{"error":{"code":"bad_request","message":"invalid filter; secret=%s; header=%s"}}`,
+			signingSecret,
+			headerSecret,
+		)
+	}))
+	defer server.Close()
+
+	_, err := New("test").WithBaseURL(server.URL).CreateLogDrain(context.Background(), CreateLogDrainRequest{
+		TeamID:         "team_123",
+		Name:           "example",
+		DeliveryFormat: "ndjson",
+		Environments:   []string{"production"},
+		Headers:        map[string]string{"x-private": headerSecret},
+		Secret:         signingSecret,
+		Sources:        []string{"static"},
+		Endpoint:       "https://example.com/logs",
+	})
+	if err == nil {
+		t.Fatal("expected response error")
+	}
+	if strings.Contains(err.Error(), signingSecret) || strings.Contains(err.Error(), headerSecret) {
+		t.Fatalf("error exposed Log Drain request secret: %s", err)
+	}
+	if !strings.Contains(err.Error(), "bad_request - invalid filter") {
+		t.Fatalf("error omitted safe API context: %s", err)
+	}
+}
+
 func TestDeleteLogDrainErrorsDoNotExposeSigningSecret(t *testing.T) {
 	t.Parallel()
 

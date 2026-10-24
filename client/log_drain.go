@@ -209,13 +209,19 @@ func (c *Client) CreateLogDrain(ctx context.Context, request CreateLogDrainReque
 		"url": url,
 	})
 
+	sensitiveResponseValues := []string{request.Secret}
+	for _, value := range hdrs {
+		sensitiveResponseValues = append(sensitiveResponseValues, value)
+	}
+
 	var resp drainsResponse
 	err = c.doRequest(clientRequest{
-		ctx:               ctx,
-		method:            "POST",
-		url:               url,
-		body:              body,
-		sensitiveResponse: true,
+		ctx:                     ctx,
+		method:                  "POST",
+		url:                     url,
+		body:                    body,
+		sensitiveResponse:       true,
+		sensitiveResponseValues: sensitiveResponseValues,
 	}, &resp)
 	if err != nil {
 		return l, err

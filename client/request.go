@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -36,15 +37,16 @@ func (e APIError) Error() string {
 }
 
 type clientRequest struct {
-	ctx               context.Context
-	method            string
-	url               string
-	body              string
-	bodyBytes         []byte
-	contentType       string
-	sensitiveResponse bool
-	errorOnNoContent  bool
-	headers           map[string]string
+	ctx                     context.Context
+	method                  string
+	url                     string
+	body                    string
+	bodyBytes               []byte
+	contentType             string
+	sensitiveResponse       bool
+	sensitiveResponseValues []string
+	errorOnNoContent        bool
+	headers                 map[string]string
 }
 
 func (cr *clientRequest) toHTTPRequest() (*http.Request, error) {
@@ -95,7 +97,7 @@ func (c *Client) doRequest(req clientRequest, v any) error {
 	}
 	err = c._doRequest(r, v, req.errorOnNoContent)
 	if req.sensitiveResponse {
-		err = sanitizeSensitiveResponseError(err)
+		err = sanitizeSensitiveResponseError(err, req.sensitiveResponseValues)
 	}
 	for retries := 0; retries < 3; retries++ {
 		var apiErr APIError
@@ -114,7 +116,7 @@ func (c *Client) doRequest(req clientRequest, v any) error {
 			}
 			err = c._doRequest(r, v, req.errorOnNoContent)
 			if req.sensitiveResponse {
-				err = sanitizeSensitiveResponseError(err)
+				err = sanitizeSensitiveResponseError(err, req.sensitiveResponseValues)
 			}
 			if err != nil {
 				continue
@@ -195,14 +197,21 @@ func (c *Client) _doRequest(req *http.Request, v any, errorOnNoContent bool) err
 	return nil
 }
 
+var sensitiveResponseTokenPattern = regexp.MustCompile(`[A-Za-z0-9_+/=-]{20,}`)
+
 // Sensitive endpoints can return bearer secrets in error messages or malformed bodies.
-func sanitizeSensitiveResponseError(err error) error {
+func sanitizeSensitiveResponseError(err error, sensitiveValues []string) error {
 	if err == nil {
 		return nil
 	}
 	var apiErr APIError
 	if errors.As(err, &apiErr) {
-		apiErr.Message = "API request failed; response details omitted to protect secrets"
+		for _, value := range sensitiveValues {
+			if value != "" {
+				apiErr.Message = strings.ReplaceAll(apiErr.Message, value, "[REDACTED]")
+			}
+		}
+		apiErr.Message = sensitiveResponseTokenPattern.ReplaceAllString(apiErr.Message, "[REDACTED]")
 		apiErr.RawMessage = nil
 		switch apiErr.Code {
 		case "not_found", "forbidden", "bad_request", "invalid_input", "project_not_found", "protection_bypass_conflict", "rate_limited":
