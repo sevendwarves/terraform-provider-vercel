@@ -95,6 +95,30 @@ func TestLogDrainWriteOnlySchema(t *testing.T) {
 	}
 }
 
+func TestLogDrainModifyPlanClearsLegacySecretForWriteOnlyConfiguration(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	var schemaResponse resource.SchemaResponse
+	providerResource := &logDrainResource{}
+	providerResource.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+	plan, config := logDrainCreatePlanAndConfig(t, schemaResponse.Schema, types.StringValue("configured-write-only-secret-at-least-thirty-two-characters"))
+	modifyResponse := resource.ModifyPlanResponse{Plan: plan}
+
+	providerResource.ModifyPlan(ctx, resource.ModifyPlanRequest{Plan: plan, Config: config}, &modifyResponse)
+	if modifyResponse.Diagnostics.HasError() {
+		t.Fatal(modifyResponse.Diagnostics)
+	}
+
+	var planned LogDrain
+	if diags := modifyResponse.Plan.Get(ctx, &planned); diags.HasError() {
+		t.Fatal(diags)
+	}
+	if !planned.Secret.IsNull() {
+		t.Fatalf("Secret = %s, want null for write-only configuration", planned.Secret)
+	}
+}
+
 func TestLogDrainCreateSendsWriteOnlySecretWithoutPersistingIt(t *testing.T) {
 	t.Parallel()
 
@@ -135,6 +159,12 @@ func TestLogDrainCreateSendsWriteOnlySecretWithoutPersistingIt(t *testing.T) {
 	var schemaResponse resource.SchemaResponse
 	providerResource.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
 	plan, config := logDrainCreatePlanAndConfig(t, schemaResponse.Schema, types.StringValue(configuredSecret))
+	modifyResponse := resource.ModifyPlanResponse{Plan: plan}
+	providerResource.ModifyPlan(ctx, resource.ModifyPlanRequest{Plan: plan, Config: config}, &modifyResponse)
+	if modifyResponse.Diagnostics.HasError() {
+		t.Fatal(modifyResponse.Diagnostics)
+	}
+	plan = modifyResponse.Plan
 	createResponse := resource.CreateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
 	providerResource.Create(ctx, resource.CreateRequest{Plan: plan, Config: config}, &createResponse)
 	if createResponse.Diagnostics.HasError() {

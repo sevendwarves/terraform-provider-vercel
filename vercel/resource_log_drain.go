@@ -32,6 +32,7 @@ var (
 	_ resource.Resource                = &logDrainResource{}
 	_ resource.ResourceWithConfigure   = &logDrainResource{}
 	_ resource.ResourceWithImportState = &logDrainResource{}
+	_ resource.ResourceWithModifyPlan  = &logDrainResource{}
 )
 
 func newLogDrainResource() resource.Resource {
@@ -186,6 +187,21 @@ Teams on Pro and Enterprise plans can subscribe to log drains that are generic a
 			},
 		},
 	}
+}
+
+func (r *logDrainResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() {
+		return
+	}
+
+	var secretWOVersion types.Int64
+	diags := req.Config.GetAttribute(ctx, path.Root("secret_wo_version"), &secretWOVersion)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() || secretWOVersion.IsNull() || secretWOVersion.IsUnknown() {
+		return
+	}
+
+	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("secret"), types.StringNull())...)
 }
 
 type LogDrain struct {
