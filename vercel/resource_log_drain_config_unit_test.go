@@ -31,6 +31,7 @@ func TestLogDrainSecretConfiguration(t *testing.T) {
 		version    any
 		wantErrors bool
 	}{
+		{name: "generated secret"},
 		{name: "legacy secret", secret: "legacy-secret-that-is-at-least-thirty-two-characters"},
 		{name: "write-only secret", secretWO: "write-only-secret-that-is-at-least-thirty-two-characters", version: int64(1)},
 		{name: "secret conflict", secret: "legacy-secret-that-is-at-least-thirty-two-characters", secretWO: "write-only-secret-that-is-at-least-thirty-two-characters", version: int64(1), wantErrors: true},

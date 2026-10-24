@@ -256,8 +256,8 @@ func (r *logDrainResource) Create(ctx context.Context, req resource.CreateReques
 		return
 	}
 
-	var config LogDrain
-	diags = req.Config.Get(ctx, &config)
+	var secretWO types.String
+	diags = req.Config.GetAttribute(ctx, path.Root("secret_wo"), &secretWO)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -292,8 +292,16 @@ func (r *logDrainResource) Create(ctx context.Context, req resource.CreateReques
 	}
 
 	secret := plan.Secret
-	if !config.SecretWO.IsNull() {
-		secret = config.SecretWO
+	switch {
+	case secretWO.IsUnknown():
+		resp.Diagnostics.AddAttributeError(
+			path.Root("secret_wo"),
+			"Unknown write-only Log Drain secret",
+			"The secret_wo value must be known when creating a Log Drain.",
+		)
+		return
+	case !secretWO.IsNull():
+		secret = secretWO
 	}
 
 	out, err := r.client.CreateLogDrain(ctx, client.CreateLogDrainRequest{

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -133,42 +134,7 @@ func TestLogDrainCreateSendsWriteOnlySecretWithoutPersistingIt(t *testing.T) {
 	providerResource := &logDrainResource{client: client.New("test").WithBaseURL(server.URL)}
 	var schemaResponse resource.SchemaResponse
 	providerResource.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
-	environments, diags := types.SetValueFrom(ctx, types.StringType, []string{"production"})
-	if diags.HasError() {
-		t.Fatal(diags)
-	}
-	headers, diags := types.MapValueFrom(ctx, types.StringType, map[string]string{})
-	if diags.HasError() {
-		t.Fatal(diags)
-	}
-	projectIDs, diags := types.SetValueFrom(ctx, types.StringType, []string{"prj_123"})
-	if diags.HasError() {
-		t.Fatal(diags)
-	}
-	sources, diags := types.SetValueFrom(ctx, types.StringType, []string{"static"})
-	if diags.HasError() {
-		t.Fatal(diags)
-	}
-	planModel := LogDrain{
-		ID:              types.StringUnknown(),
-		TeamID:          types.StringValue("team_123"),
-		Name:            types.StringValue("example"),
-		DeliveryFormat:  types.StringValue("ndjson"),
-		Environments:    environments,
-		Headers:         headers,
-		ProjectIDs:      projectIDs,
-		SamplingRate:    types.Float64Null(),
-		Secret:          types.StringNull(),
-		SecretWO:        types.StringValue(configuredSecret),
-		SecretWOVersion: types.Int64Value(7),
-		Sources:         sources,
-		Endpoint:        types.StringValue("https://example.com/logs"),
-	}
-	plan := tfsdk.Plan{Schema: schemaResponse.Schema}
-	if diags := plan.Set(ctx, planModel); diags.HasError() {
-		t.Fatal(diags)
-	}
-	config := tfsdk.Config{Schema: schemaResponse.Schema, Raw: plan.Raw}
+	plan, config := logDrainCreatePlanAndConfig(t, schemaResponse.Schema, types.StringValue(configuredSecret))
 	createResponse := resource.CreateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
 	providerResource.Create(ctx, resource.CreateRequest{Plan: plan, Config: config}, &createResponse)
 	if createResponse.Diagnostics.HasError() {
@@ -190,6 +156,44 @@ func TestLogDrainCreateSendsWriteOnlySecretWithoutPersistingIt(t *testing.T) {
 	}
 	if got := state.SecretWOVersion.ValueInt64(); got != 7 {
 		t.Fatalf("SecretWOVersion = %d, want 7", got)
+	}
+}
+
+func TestLogDrainCreateRejectsUnknownWriteOnlySecret(t *testing.T) {
+	t.Parallel()
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("content-type", "application/json")
+		fmt.Fprint(w, `{
+			"id":"ld_123",
+			"ownerId":"team_123",
+			"name":"example",
+			"projectIds":["prj_123"],
+			"delivery":{"type":"http","endpoint":"https://example.com/logs","encoding":"ndjson","headers":{},"secret":"generated-secret"},
+			"filterV2":{"version":"v2","filter":{"type":"basic","log":{"sources":["static"]},"deployment":{"environments":["production"]}}},
+			"sampling":[]
+		}`)
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	providerResource := &logDrainResource{client: client.New("test").WithBaseURL(server.URL)}
+	var schemaResponse resource.SchemaResponse
+	providerResource.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+	plan, config := logDrainCreatePlanAndConfig(t, schemaResponse.Schema, types.StringUnknown())
+	createResponse := resource.CreateResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	providerResource.Create(ctx, resource.CreateRequest{Plan: plan, Config: config}, &createResponse)
+
+	if !createResponse.Diagnostics.HasError() {
+		t.Fatal("Create() accepted an unknown secret_wo value")
+	}
+	if got := createResponse.Diagnostics.Errors()[0].Summary(); got != "Unknown write-only Log Drain secret" {
+		t.Fatalf("Create() diagnostic summary = %q", got)
+	}
+	if requests != 0 {
+		t.Fatalf("Create() sent %d API requests with an unknown secret_wo value", requests)
 	}
 }
 
@@ -272,6 +276,48 @@ func TestLogDrainImportSecretHandling(t *testing.T) {
 			}
 		})
 	}
+}
+
+func logDrainCreatePlanAndConfig(t *testing.T, resourceSchema schema.Schema, secretWO types.String) (tfsdk.Plan, tfsdk.Config) {
+	t.Helper()
+
+	ctx := context.Background()
+	planModel := LogDrain{
+		ID:             types.StringUnknown(),
+		TeamID:         types.StringValue("team_123"),
+		Name:           types.StringValue("example"),
+		DeliveryFormat: types.StringValue("ndjson"),
+		Environments: types.SetValueMust(types.StringType, []attr.Value{
+			types.StringValue("production"),
+		}),
+		Headers: types.MapValueMust(types.StringType, map[string]attr.Value{}),
+		ProjectIDs: types.SetValueMust(types.StringType, []attr.Value{
+			types.StringValue("prj_123"),
+		}),
+		SamplingRate:    types.Float64Null(),
+		Secret:          types.StringUnknown(),
+		SecretWO:        types.StringNull(),
+		SecretWOVersion: types.Int64Value(7),
+		Sources: types.SetValueMust(types.StringType, []attr.Value{
+			types.StringValue("static"),
+		}),
+		Endpoint: types.StringValue("https://example.com/logs"),
+	}
+	plan := tfsdk.Plan{Schema: resourceSchema}
+	if diags := plan.Set(ctx, planModel); diags.HasError() {
+		t.Fatal(diags)
+	}
+
+	configModel := planModel
+	configModel.ID = types.StringNull()
+	configModel.Secret = types.StringNull()
+	configModel.SecretWO = secretWO
+	configState := tfsdk.State{Schema: resourceSchema}
+	if diags := configState.Set(ctx, configModel); diags.HasError() {
+		t.Fatal(diags)
+	}
+
+	return plan, tfsdk.Config{Schema: resourceSchema, Raw: configState.Raw}
 }
 
 func logDrainResponse(secret string) client.LogDrain {
