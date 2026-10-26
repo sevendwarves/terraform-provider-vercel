@@ -17,6 +17,7 @@ resource "vercel_log_drain" "example" {
   project_ids       = [vercel_project.example.id]
   sampling_rate     = 0.8
   secret_wo         = ephemeral.random_password.log_drain_secret.result
+  # Optional: increment to replace the Log Drain when rotating the secret.
   secret_wo_version = 1
   sources           = ["static"]
   endpoint          = "https://example.com/my-log-drain-endpoint"

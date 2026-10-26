@@ -9,10 +9,12 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
 	"github.com/vercel/terraform-provider-vercel/v5/client"
 )
@@ -25,6 +27,7 @@ func TestResponseToLogDrainPreservesLegacySecret(t *testing.T) {
 		logDrainResponse("api-generated-signing-secret-that-must-be-persisted"),
 		types.StringNull(),
 		types.Int64Null(),
+		false,
 	)
 	if diags.HasError() {
 		t.Fatal(diags)
@@ -48,6 +51,7 @@ func TestResponseToLogDrainOmitsWriteOnlySecret(t *testing.T) {
 		logDrainResponse("api-secret-that-must-never-enter-terraform-state"),
 		types.StringValue("configured-secret-that-must-never-enter-terraform-state"),
 		types.Int64Value(7),
+		true,
 	)
 	if diags.HasError() {
 		t.Fatal(diags)
@@ -104,10 +108,14 @@ func TestLogDrainModifyPlanClearsLegacySecretForWriteOnlyConfiguration(t *testin
 	providerResource.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
 	plan, config := logDrainCreatePlanAndConfig(t, schemaResponse.Schema, types.StringValue("configured-write-only-secret-at-least-thirty-two-characters"))
 	modifyResponse := resource.ModifyPlanResponse{Plan: plan}
+	emptyState := tfsdk.State{Schema: schemaResponse.Schema, Raw: tftypes.NewValue(schemaResponse.Schema.Type().TerraformType(ctx), nil)}
 
-	providerResource.ModifyPlan(ctx, resource.ModifyPlanRequest{Plan: plan, Config: config}, &modifyResponse)
+	providerResource.ModifyPlan(ctx, resource.ModifyPlanRequest{Plan: plan, Config: config, State: emptyState}, &modifyResponse)
 	if modifyResponse.Diagnostics.HasError() {
 		t.Fatal(modifyResponse.Diagnostics)
+	}
+	if len(modifyResponse.RequiresReplace) != 0 {
+		t.Fatalf("new resource replacement paths = %v, want none", modifyResponse.RequiresReplace)
 	}
 
 	var planned LogDrain
@@ -119,38 +127,104 @@ func TestLogDrainModifyPlanClearsLegacySecretForWriteOnlyConfiguration(t *testin
 	}
 }
 
+func TestLogDrainModifyPlanReplacesWhenChangingSecretMode(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		secretWO    types.String
+		priorSecret types.String
+	}{
+		{
+			name:        "legacy to write-only without version",
+			secretWO:    types.StringValue("configured-write-only-secret-at-least-thirty-two-characters"),
+			priorSecret: types.StringValue("legacy-secret-that-is-at-least-thirty-two-characters"),
+		},
+		{
+			name:        "write-only to generated",
+			secretWO:    types.StringNull(),
+			priorSecret: types.StringNull(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			var schemaResponse resource.SchemaResponse
+			providerResource := &logDrainResource{}
+			providerResource.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
+			plan, config := logDrainCreatePlanAndConfig(t, schemaResponse.Schema, tc.secretWO)
+
+			var prior LogDrain
+			if diags := plan.Get(ctx, &prior); diags.HasError() {
+				t.Fatal(diags)
+			}
+			prior.ID = types.StringValue("ld_123")
+			prior.Secret = tc.priorSecret
+			priorState := tfsdk.State{Schema: schemaResponse.Schema}
+			if diags := priorState.Set(ctx, prior); diags.HasError() {
+				t.Fatal(diags)
+			}
+
+			modifyResponse := resource.ModifyPlanResponse{Plan: plan}
+			providerResource.ModifyPlan(ctx, resource.ModifyPlanRequest{Plan: plan, Config: config, State: priorState}, &modifyResponse)
+			if modifyResponse.Diagnostics.HasError() {
+				t.Fatal(modifyResponse.Diagnostics)
+			}
+			if len(modifyResponse.RequiresReplace) != 1 || !modifyResponse.RequiresReplace[0].Equal(path.Root("secret_wo")) {
+				t.Fatalf("replacement paths = %v, want [secret_wo]", modifyResponse.RequiresReplace)
+			}
+
+			var planned LogDrain
+			if diags := modifyResponse.Plan.Get(ctx, &planned); diags.HasError() {
+				t.Fatal(diags)
+			}
+			if !tc.secretWO.IsNull() && !planned.Secret.IsNull() {
+				t.Fatalf("Secret = %s, want null for write-only migration", planned.Secret)
+			}
+		})
+	}
+}
+
 func TestLogDrainCreateSendsWriteOnlySecretWithoutPersistingIt(t *testing.T) {
 	t.Parallel()
 
 	const configuredSecret = "configured-write-only-secret-at-least-thirty-two-characters"
 	var receivedSecret string
+	const apiResponse = `{
+		"id":"ld_123",
+		"ownerId":"team_123",
+		"name":"example",
+		"projectIds":["prj_123"],
+		"delivery":{"type":"http","endpoint":"https://example.com/logs","encoding":"ndjson","headers":{},"secret":"api-secret-that-must-never-enter-terraform-state"},
+		"filterV2":{"version":"v2","filter":{"type":"basic","log":{"sources":["static"]},"deployment":{"environments":["production"]}}},
+		"sampling":[]
+	}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPost || req.URL.Path != "/v1/drains" || req.URL.Query().Get("teamId") != "team_123" {
+		if req.URL.Query().Get("teamId") != "team_123" {
 			t.Errorf("unexpected request: %s %s", req.Method, req.URL)
 			http.NotFound(w, req)
 			return
 		}
-		var payload struct {
-			Delivery struct {
-				Secret string `json:"secret"`
-			} `json:"delivery"`
-		}
-		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
-			t.Errorf("decoding request: %s", err)
-			http.Error(w, "invalid request", http.StatusBadRequest)
+		switch {
+		case req.Method == http.MethodPost && req.URL.Path == "/v1/drains":
+			var payload struct {
+				Delivery struct {
+					Secret string `json:"secret"`
+				} `json:"delivery"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+				t.Errorf("decoding request: %s", err)
+				http.Error(w, "invalid request", http.StatusBadRequest)
+				return
+			}
+			receivedSecret = payload.Delivery.Secret
+		case req.Method == http.MethodGet && req.URL.Path == "/v1/drains/ld_123":
+		default:
+			t.Errorf("unexpected request: %s %s", req.Method, req.URL)
+			http.NotFound(w, req)
 			return
 		}
-		receivedSecret = payload.Delivery.Secret
 		w.Header().Set("content-type", "application/json")
-		fmt.Fprint(w, `{
-			"id":"ld_123",
-			"ownerId":"team_123",
-			"name":"example",
-			"projectIds":["prj_123"],
-			"delivery":{"type":"http","endpoint":"https://example.com/logs","encoding":"ndjson","headers":{},"secret":"api-secret-that-must-never-enter-terraform-state"},
-			"filterV2":{"version":"v2","filter":{"type":"basic","log":{"sources":["static"]},"deployment":{"environments":["production"]}}},
-			"sampling":[]
-		}`)
+		fmt.Fprint(w, apiResponse)
 	}))
 	defer server.Close()
 
@@ -159,8 +233,9 @@ func TestLogDrainCreateSendsWriteOnlySecretWithoutPersistingIt(t *testing.T) {
 	var schemaResponse resource.SchemaResponse
 	providerResource.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
 	plan, config := logDrainCreatePlanAndConfig(t, schemaResponse.Schema, types.StringValue(configuredSecret))
+	emptyState := tfsdk.State{Schema: schemaResponse.Schema, Raw: tftypes.NewValue(schemaResponse.Schema.Type().TerraformType(ctx), nil)}
 	modifyResponse := resource.ModifyPlanResponse{Plan: plan}
-	providerResource.ModifyPlan(ctx, resource.ModifyPlanRequest{Plan: plan, Config: config}, &modifyResponse)
+	providerResource.ModifyPlan(ctx, resource.ModifyPlanRequest{Plan: plan, Config: config, State: emptyState}, &modifyResponse)
 	if modifyResponse.Diagnostics.HasError() {
 		t.Fatal(modifyResponse.Diagnostics)
 	}
@@ -184,8 +259,20 @@ func TestLogDrainCreateSendsWriteOnlySecretWithoutPersistingIt(t *testing.T) {
 	if !state.SecretWO.IsNull() {
 		t.Fatalf("SecretWO = %s, want null", state.SecretWO)
 	}
-	if got := state.SecretWOVersion.ValueInt64(); got != 7 {
-		t.Fatalf("SecretWOVersion = %d, want 7", got)
+	if !state.SecretWOVersion.IsNull() {
+		t.Fatalf("SecretWOVersion = %s, want null", state.SecretWOVersion)
+	}
+
+	readResponse := resource.ReadResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+	providerResource.Read(ctx, resource.ReadRequest{State: createResponse.State}, &readResponse)
+	if readResponse.Diagnostics.HasError() {
+		t.Fatal(readResponse.Diagnostics)
+	}
+	if diags := readResponse.State.Get(ctx, &state); diags.HasError() {
+		t.Fatal(diags)
+	}
+	if !state.Secret.IsNull() || !state.SecretWO.IsNull() || !state.SecretWOVersion.IsNull() {
+		t.Fatalf("refresh persisted write-only secret state: %#v", state)
 	}
 }
 
@@ -255,22 +342,18 @@ func TestLogDrainImportSecretHandling(t *testing.T) {
 	providerResource.Schema(ctx, resource.SchemaRequest{}, &schemaResponse)
 
 	for _, tc := range []struct {
-		name                string
-		importID            string
-		wantSecret          string
-		wantVersionNull     bool
-		wantWriteOnlyMarker int64
+		name       string
+		importID   string
+		wantSecret string
 	}{
 		{
-			name:            "legacy import preserves API secret",
-			importID:        "team_123/ld_123",
-			wantSecret:      "api-returned-signing-secret-at-least-thirty-two-characters",
-			wantVersionNull: true,
+			name:       "legacy import preserves API secret",
+			importID:   "team_123/ld_123",
+			wantSecret: "api-returned-signing-secret-at-least-thirty-two-characters",
 		},
 		{
-			name:                "write-only import omits API secret",
-			importID:            "write-only:team_123/ld_123",
-			wantWriteOnlyMarker: 0,
+			name:     "write-only import omits API secret",
+			importID: "write-only:team_123/ld_123",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -280,8 +363,18 @@ func TestLogDrainImportSecretHandling(t *testing.T) {
 				t.Fatal(importResponse.Diagnostics)
 			}
 
+			stateAfterOperation := importResponse.State
+			if tc.wantSecret == "" {
+				readResponse := resource.ReadResponse{State: tfsdk.State{Schema: schemaResponse.Schema}}
+				providerResource.Read(ctx, resource.ReadRequest{State: importResponse.State}, &readResponse)
+				if readResponse.Diagnostics.HasError() {
+					t.Fatal(readResponse.Diagnostics)
+				}
+				stateAfterOperation = readResponse.State
+			}
+
 			var state LogDrain
-			if diags := importResponse.State.Get(ctx, &state); diags.HasError() {
+			if diags := stateAfterOperation.Get(ctx, &state); diags.HasError() {
 				t.Fatal(diags)
 			}
 			if tc.wantSecret == "" {
@@ -294,12 +387,8 @@ func TestLogDrainImportSecretHandling(t *testing.T) {
 			if !state.SecretWO.IsNull() {
 				t.Fatalf("SecretWO = %s, want null", state.SecretWO)
 			}
-			if tc.wantVersionNull {
-				if !state.SecretWOVersion.IsNull() {
-					t.Fatalf("SecretWOVersion = %s, want null", state.SecretWOVersion)
-				}
-			} else if got := state.SecretWOVersion.ValueInt64(); got != tc.wantWriteOnlyMarker {
-				t.Fatalf("SecretWOVersion = %d, want import marker %d", got, tc.wantWriteOnlyMarker)
+			if !state.SecretWOVersion.IsNull() {
+				t.Fatalf("SecretWOVersion = %s, want null", state.SecretWOVersion)
 			}
 			if got := state.ID.ValueString(); got != "ld_123" {
 				t.Fatalf("ID = %q, want ld_123", got)
@@ -327,7 +416,7 @@ func logDrainCreatePlanAndConfig(t *testing.T, resourceSchema schema.Schema, sec
 		SamplingRate:    types.Float64Null(),
 		Secret:          types.StringUnknown(),
 		SecretWO:        types.StringNull(),
-		SecretWOVersion: types.Int64Value(7),
+		SecretWOVersion: types.Int64Null(),
 		Sources: types.SetValueMust(types.StringType, []attr.Value{
 			types.StringValue("static"),
 		}),

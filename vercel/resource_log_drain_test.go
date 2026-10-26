@@ -91,7 +91,7 @@ func TestAcc_LogDrainResource(t *testing.T) {
 
 					testCheckLogDrainExists(testClient(t), testTeam(t), "vercel_log_drain.write_only"),
 					resource.TestCheckResourceAttr("vercel_log_drain.write_only", "delivery_format", "ndjson"),
-					resource.TestCheckResourceAttr("vercel_log_drain.write_only", "secret_wo_version", "1"),
+					resource.TestCheckNoResourceAttr("vercel_log_drain.write_only", "secret_wo_version"),
 					resource.TestCheckNoResourceAttr("vercel_log_drain.write_only", "secret"),
 					resource.TestCheckNoResourceAttr("vercel_log_drain.write_only", "secret_wo"),
 				),
@@ -136,7 +136,6 @@ resource "vercel_log_drain" "write_only" {
     delivery_format         = "ndjson"
     environments            = ["production"]
     secret_wo               = "a_write_only_secret_that_must_not_reach_state"
-    secret_wo_version       = 1
     sources                 = ["static"]
     endpoint = "https://verify-test-rouge.vercel.app/api?${data.vercel_endpoint_verification.test.verification_code}"
 }

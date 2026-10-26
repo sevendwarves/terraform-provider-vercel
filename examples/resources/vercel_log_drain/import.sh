@@ -9,6 +9,6 @@ terraform import vercel_log_drain.example ld_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 terraform import vercel_log_drain.example team_xxxxxxxxxxxxxxxxxxxxxxxx/ld_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # Prefix either import format with "write-only:" to omit the existing signing
-# secret from Terraform state. Configure secret_wo and secret_wo_version after
-# import; the first valid version replaces the drain with the configured secret.
+# secret from Terraform state. Configure secret_wo after import. To replace the
+# drain with that secret, also configure secret_wo_version or use -replace.
 terraform import vercel_log_drain.example write-only:team_xxxxxxxxxxxxxxxxxxxxxxxx/ld_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

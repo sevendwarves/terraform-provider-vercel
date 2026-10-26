@@ -151,18 +151,17 @@ Teams on Pro and Enterprise plans can subscribe to log drains that are generic a
 				},
 			},
 			"secret_wo": schema.StringAttribute{
-				Description: "A write-only custom secret used to sign log events. The value is sent to Vercel during creation and is not persisted in Terraform plan or state artifacts. Requires `secret_wo_version`.",
+				Description: "A write-only custom secret used to sign log events. The value is sent to Vercel during creation and is not persisted in Terraform plan or state artifacts.",
 				Optional:    true,
 				Sensitive:   true,
 				WriteOnly:   true,
 				Validators: []validator.String{
 					stringvalidator.LengthAtLeast(32),
 					stringvalidator.ConflictsWith(path.MatchRoot("secret")),
-					stringvalidator.AlsoRequires(path.MatchRoot("secret_wo_version")),
 				},
 			},
 			"secret_wo_version": schema.Int64Attribute{
-				Description:   "A persisted, non-secret version used to rotate `secret_wo`. Incrementing this value replaces the Log Drain.",
+				Description:   "An optional persisted, non-secret version used to rotate `secret_wo`. Incrementing this value replaces the Log Drain.",
 				Optional:      true,
 				PlanModifiers: []planmodifier.Int64{int64planmodifier.RequiresReplace()},
 				Validators: []validator.Int64{
@@ -194,14 +193,35 @@ func (r *logDrainResource) ModifyPlan(ctx context.Context, req resource.ModifyPl
 		return
 	}
 
-	var secretWOVersion types.Int64
-	diags := req.Config.GetAttribute(ctx, path.Root("secret_wo_version"), &secretWOVersion)
+	var secretWO types.String
+	diags := req.Config.GetAttribute(ctx, path.Root("secret_wo"), &secretWO)
 	resp.Diagnostics.Append(diags...)
-	if resp.Diagnostics.HasError() || secretWOVersion.IsNull() || secretWOVersion.IsUnknown() {
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("secret"), types.StringNull())...)
+	isConfigWriteOnly := !secretWO.IsNull()
+	if isConfigWriteOnly {
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("secret"), types.StringNull())...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
+	if req.State.Raw.IsNull() {
+		return
+	}
+
+	var stateSecret types.String
+	diags = req.State.GetAttribute(ctx, path.Root("secret"), &stateSecret)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	if stateSecret.IsNull() != isConfigWriteOnly {
+		resp.RequiresReplace = append(resp.RequiresReplace, path.Root("secret_wo"))
+	}
 }
 
 type LogDrain struct {
@@ -220,7 +240,7 @@ type LogDrain struct {
 	Endpoint        types.String  `tfsdk:"endpoint"`
 }
 
-func responseToLogDrain(ctx context.Context, out client.LogDrain, secret types.String, secretWOVersion types.Int64) (LogDrain, diag.Diagnostics) {
+func responseToLogDrain(ctx context.Context, out client.LogDrain, secret types.String, secretWOVersion types.Int64, isWriteOnly bool) (LogDrain, diag.Diagnostics) {
 	projectIDs, diags := types.SetValueFrom(ctx, types.StringType, out.ProjectIDs)
 	if diags.HasError() {
 		return LogDrain{}, diags
@@ -241,7 +261,7 @@ func responseToLogDrain(ctx context.Context, out client.LogDrain, secret types.S
 		return LogDrain{}, diags
 	}
 
-	if !secretWOVersion.IsNull() {
+	if isWriteOnly {
 		secret = types.StringNull()
 	} else if secret.IsNull() || secret.IsUnknown() {
 		secret = types.StringValue(out.Secret)
@@ -340,7 +360,7 @@ func (r *logDrainResource) Create(ctx context.Context, req resource.CreateReques
 		return
 	}
 
-	result, diags := responseToLogDrain(ctx, out, plan.Secret, plan.SecretWOVersion)
+	result, diags := responseToLogDrain(ctx, out, plan.Secret, plan.SecretWOVersion, !secretWO.IsNull())
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -387,7 +407,7 @@ func (r *logDrainResource) Read(ctx context.Context, req resource.ReadRequest, r
 		return
 	}
 
-	result, diags := responseToLogDrain(ctx, out, state.Secret, state.SecretWOVersion)
+	result, diags := responseToLogDrain(ctx, out, state.Secret, state.SecretWOVersion, state.Secret.IsNull())
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -475,13 +495,7 @@ func (r *logDrainResource) ImportState(ctx context.Context, req resource.ImportS
 		return
 	}
 
-	secretWOVersion := types.Int64Null()
-	if writeOnly {
-		// Version zero marks imported state as write-only while ensuring every
-		// valid configured version forces replacement with a known secret.
-		secretWOVersion = types.Int64Value(0)
-	}
-	result, diags := responseToLogDrain(ctx, out, types.StringNull(), secretWOVersion)
+	result, diags := responseToLogDrain(ctx, out, types.StringNull(), types.Int64Null(), writeOnly)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
