@@ -35,7 +35,7 @@ func TestLogDrainSecretConfiguration(t *testing.T) {
 		{name: "legacy secret", secret: "legacy-secret-that-is-at-least-thirty-two-characters"},
 		{name: "write-only secret", secretWO: "write-only-secret-that-is-at-least-thirty-two-characters", version: int64(1)},
 		{name: "secret conflict", secret: "legacy-secret-that-is-at-least-thirty-two-characters", secretWO: "write-only-secret-that-is-at-least-thirty-two-characters", version: int64(1), wantErrors: true},
-		{name: "write-only secret without version", secretWO: "write-only-secret-that-is-at-least-thirty-two-characters", wantErrors: true},
+		{name: "write-only secret without version", secretWO: "write-only-secret-that-is-at-least-thirty-two-characters"},
 		{name: "version without write-only secret", version: int64(1), wantErrors: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
